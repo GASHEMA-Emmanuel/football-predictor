@@ -33,18 +33,18 @@ st.markdown(
     .kpi .value { font-size: 2rem; font-weight: 700; line-height: 1.25; }
     .kpi .sub { font-size: .82rem; opacity: .85; }
     /* floating chat bubble (bottom-right, every page) */
-    .st-key-chat_fab { position: fixed; right: 1.5rem; bottom: 1.5rem; z-index: 1000; width: auto !important; }
+    .st-key-chat_fab { position: fixed; right: 1.5rem; bottom: calc(1.5rem + 2cm); z-index: 1000; width: auto !important; }
     .st-key-chat_fab button { border-radius: 999px; padding: .65rem 1.15rem; font-weight: 600;
                               box-shadow: 0 6px 18px rgba(0,0,0,.25); }
     [data-testid="stPopoverBody"]:has(.st-key-chat_box) { width: min(400px, 92vw); max-width: 92vw; }
     /* chat history height: shrink on short/narrow screens so the input box stays visible */
-    [data-testid="stPopoverBody"] { --chat-h: min(380px, calc(100vh - 300px)); }
+    [data-testid="stPopoverBody"] { --chat-h: min(380px, calc(100vh - 300px - 2cm)); }
     .st-key-chat_log, [data-testid="stLayoutWrapper"]:has(> .st-key-chat_log) {
         height: var(--chat-h) !important; max-height: var(--chat-h) !important;
         flex: 0 0 var(--chat-h) !important; }
     @media (max-width: 640px) {
-        [data-testid="stPopoverBody"] { --chat-h: max(180px, calc(100vh - 560px)); }
-        .st-key-chat_fab { right: 1rem; bottom: 1rem; }
+        [data-testid="stPopoverBody"] { --chat-h: max(180px, calc(100vh - 560px - 2cm)); }
+        .st-key-chat_fab { right: 1rem; bottom: calc(1rem + 2cm); }
     }
     </style>
     """,
