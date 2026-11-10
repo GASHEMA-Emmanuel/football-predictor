@@ -6,6 +6,7 @@ import pandas as pd
 import streamlit as st
 
 import assistant
+import competitions
 import data
 import model
 import picks
@@ -71,29 +72,68 @@ def get_upcoming(div: str, n_seasons: int, data_version: str):  # so a failed sc
 
 
 HORIZON_DAYS = 21  # how far ahead cross-league features look
+JOINT_L2 = 1.0  # pulls low-data teams (e.g. 3 cup games) towards average instead of extremes
+MIN_MATCHES_FOR_PICKS = 10  # teams with less history are shown, but left out of pick features
 
 
-@st.cache_data(ttl=1800, show_spinner="Loading fixtures across leagues…")
+@st.cache_resource(ttl=6 * 3600, show_spinner="Fitting the European model (all leagues + cups)…")
+def get_europe_model(n_seasons: int, half_life: int):
+    """One model over every domestic league plus European cup results, so clubs from different
+    leagues can be compared. Returns (model, cup name -> model name mapping)."""
+    with ThreadPoolExecutor(max_workers=len(data.LEAGUES)) as pool:
+        domestic = list(pool.map(lambda d: get_results(d, n_seasons), data.LEAGUES))
+    matches, mapping = competitions.europe_matches(domestic, seasons=2)
+    return model.DixonColes.fit(matches, half_life_days=half_life, l2=JOINT_L2), mapping
+
+
+@st.cache_resource(ttl=6 * 3600, show_spinner="Fitting the international model…")
+def get_intl_model():
+    """National teams, last 8 years of internationals; slower decay since teams play rarely."""
+    return model.DixonColes.fit(competitions.international_results(8), half_life_days=730, l2=JOINT_L2)
+
+
+def comp_fixtures(code: str, n_seasons: int, half_life: int) -> tuple[model.DixonColes, pd.DataFrame]:
+    """Model + upcoming fixtures for a cup or international competition code."""
+    if code in competitions.CUPS:
+        mdl, mapping = get_europe_model(n_seasons, half_life)
+        return mdl, competitions.cup_fixtures(code, mapping)
+    mdl = get_intl_model()
+    return mdl, competitions.international_fixtures(code, set(mdl.teams))
+
+
+@st.cache_data(ttl=1800, show_spinner="Loading fixtures across competitions…")
 def get_candidates(leagues: tuple, n_seasons: int, half_life: int, time_bucket: str):
     """One row per (upcoming match, market) across `leagues`. time_bucket refreshes the cache."""
     horizon = pd.Timestamp.now(tz=data.UK) + pd.Timedelta(days=HORIZON_DAYS)
 
     def one(div):
+        name = ALL_NAMES[div]
         try:
-            results = get_results(div, n_seasons)
-            version = str(results["Date"].max().date())
-            mdl = get_model(div, n_seasons, half_life, version)
-            fx, _, sched_err = get_upcoming(div, n_seasons, version)
-            note = f"{data.LEAGUES[div]}: {sched_err}" if sched_err else None
+            if div in competitions.COMPETITIONS:
+                mdl, fx = comp_fixtures(div, n_seasons, half_life)
+                note = None
+            else:
+                results = get_results(div, n_seasons)
+                version = str(results["Date"].max().date())
+                mdl = get_model(div, n_seasons, half_life, version)
+                fx, _, sched_err = get_upcoming(div, n_seasons, version)
+                note = f"{name}: {sched_err}" if sched_err else None
             return div, mdl, fx[fx["Kickoff"] < horizon] if not fx.empty else fx, note
-        except Exception as e:  # network hiccup etc.: skip this league, keep the rest
-            return div, None, None, f"{data.LEAGUES[div]}: {type(e).__name__}: {e}"
+        except Exception as e:  # network hiccup etc.: skip this competition, keep the rest
+            return div, None, None, f"{name}: {type(e).__name__}: {e}"
+
+    # the joint European model is shared by three cups: build it once before fanning out
+    if any(d in competitions.CUPS for d in leagues):
+        try:
+            get_europe_model(n_seasons, half_life)
+        except Exception:
+            pass  # each cup reports its own error below
 
     with ThreadPoolExecutor(max_workers=len(leagues) or 1) as pool:  # leagues download in parallel
         loaded = list(pool.map(one, leagues))
     fixtures = [(div, mdl, fx) for div, mdl, fx, _ in loaded if fx is not None and not fx.empty]
     problems = [note for *_, note in loaded if note]
-    return picks.build_candidates(fixtures), problems
+    return picks.build_candidates(fixtures, min_matches=MIN_MATCHES_FOR_PICKS), problems
 
 
 @st.cache_data(show_spinner="Running backtest…")
@@ -106,6 +146,7 @@ def get_backtest(div, n_seasons, half_life, test_days, min_edge, data_version):
 
 # ---------------- shared helpers ----------------
 ss.setdefault("league", "E0")
+ALL_NAMES = {**data.LEAGUES, **competitions.COMPETITIONS}
 
 
 def pct(x):
@@ -218,17 +259,18 @@ def page_top_picks():
     header("Top picks", "Most likely results", league_picker=False)
     st.caption(
         "The model's single most likely outcome for every upcoming match across Europe's top "
-        "leagues, ranked by probability. One pick per match."
+        "leagues, the European cups and the Nations League, ranked by probability. One pick per match. "
+        f"Matches involving a team with fewer than {MIN_MATCHES_FOR_PICKS} games of history are left out."
     )
     c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
     leagues = c1.multiselect(
-        "Leagues", list(data.LEAGUES), default=data.TOP10, format_func=data.LEAGUES.get,
+        "Competitions", list(ALL_NAMES), default=competitions.DEFAULT_PICK_SET, format_func=ALL_NAMES.get,
     )
     market_set = c2.selectbox("Markets", list(model.MARKET_SETS))
     n_picks = c3.number_input("Picks", 3, 20, 10)
     days = c4.number_input("Days ahead", 1, HORIZON_DAYS, 7, help="Counted from the first upcoming kick-off.")
     if not leagues:
-        st.info("Choose at least one league.")
+        st.info("Choose at least one competition.")
         return
 
     cands, _ = load_candidates(leagues)
@@ -255,7 +297,7 @@ def page_top_picks():
         ("Combined odds", f"{1 / all_win:.2f}", f"fair · {combined_market}"),
     ])
     show_legs(best, rank=True)
-    empty = sorted(set(data.LEAGUES[d] for d in leagues) - set(cands["League"]))
+    empty = sorted(set(ALL_NAMES[d] for d in leagues) - set(cands["League"]))
     st.caption(
         f"Fixtures from {start:%a %d %b} to {end - pd.Timedelta(days=1):%a %d %b}. "
         "Market odds are bookmaker averages, available only once football-data publishes the round "
@@ -291,9 +333,9 @@ def page_daily_pick():
     header("Top picks", "Daily pick", league_picker=False)
     st.caption(
         "The most probable accumulator for a day whose combined odds land in your target range. "
-        "One leg per match, picked across Europe's top leagues."
+        "One leg per match, picked across Europe's top leagues, the European cups and the Nations League."
     )
-    cands, _ = load_candidates(data.TOP10)
+    cands, _ = load_candidates(competitions.DEFAULT_PICK_SET)
     if cands.empty:
         st.info("No upcoming fixtures loaded yet.")
         return
@@ -385,7 +427,7 @@ def chat_widget():
             if question:
                 ss.chat.append({"role": "user", "content": question})
                 with log, st.spinner("Thinking…"):
-                    cands, _ = load_candidates(data.TOP10)  # loaded only when someone asks
+                    cands, _ = load_candidates(competitions.DEFAULT_PICK_SET)  # loaded only when someone asks
                     today = pd.Timestamp.now(tz=data.UK).date()
                     reply = None
                     if use_claude:
@@ -599,6 +641,153 @@ def page_backtest():
     st.dataframe(bt.assign(Date=bt.Date.dt.date), hide_index=True, width="stretch")
 
 
+def prediction_table(fx: pd.DataFrame, mdl: model.DixonColes):
+    """Upcoming matches with model probabilities; flags teams with little history."""
+    rows = []
+    for f in fx.to_dict("records"):
+        home, away = f["HomeTeam"], f["AwayTeam"]
+        if not (mdl.knows(home) and mdl.knows(away)):
+            continue
+        p = mdl.predict(home, away)
+        games = min(mdl.n_matches.get(home, 0), mdl.n_matches.get(away, 0))
+        rows.append({
+            "Kick-off (UK)": f["Kickoff"].strftime("%a %d %b %H:%M"),
+            "Match": f"{home} vs {away}",
+            "Home": p["home"], "Draw": p["draw"], "Away": p["away"],
+            "Over 2.5": p["over_2_5"], "BTTS": p["btts"],
+            "xG": f"{p['xG_home']:.2f} – {p['xG_away']:.2f}",
+            "Likely score": p["top_scores"][0][0],
+            "Fair odds (H/D/A)": f"{1/p['home']:.2f} / {1/p['draw']:.2f} / {1/p['away']:.2f}",
+            "History": "⚠ limited" if games < MIN_MATCHES_FOR_PICKS else "ok",
+        })
+    if not rows:
+        st.info("No upcoming matches with known teams.")
+        return
+    st.dataframe(
+        pd.DataFrame(rows), hide_index=True, width="stretch",
+        column_config={
+            **{k: prob_col(k) for k in ["Home", "Draw", "Away", "Over 2.5", "BTTS"]},
+            "History": st.column_config.TextColumn(
+                help=f"⚠ = a team has fewer than {MIN_MATCHES_FOR_PICKS} matches in the data, "
+                     "so this prediction is much less reliable."),
+        },
+    )
+
+
+def match_card(mdl: model.DixonColes, home: str, away: str, neutral: bool):
+    p = mdl.predict(home, away, neutral=neutral)
+    c = st.columns(5)
+    c[0].metric(f"{home} win", pct(p["home"]), f"fair {1/p['home']:.2f}", delta_color="off")
+    c[1].metric("Draw", pct(p["draw"]), f"fair {1/p['draw']:.2f}", delta_color="off")
+    c[2].metric(f"{away} win", pct(p["away"]), f"fair {1/p['away']:.2f}", delta_color="off")
+    c[3].metric("Over 2.5 goals", pct(p["over_2_5"]))
+    c[4].metric("Both teams score", pct(p["btts"]))
+    st.write(f"**Expected goals:** {home} {p['xG_home']:.2f} – {p['xG_away']:.2f} {away} · "
+             "**Most likely scores:** " + " · ".join(f"{s} ({pr:.0%})" for s, pr in p["top_scores"][:4]))
+    few = [t for t in (home, away) if mdl.n_matches.get(t, 0) < MIN_MATCHES_FOR_PICKS]
+    if few:
+        st.caption(f"⚠ Limited history for {', '.join(few)}: treat this prediction with extra caution.")
+
+
+def page_cups():
+    header("Europe & International", "European cups", league_picker=False)
+    code = st.segmented_control(
+        "Competition", list(competitions.CUPS), default="UCL",
+        format_func=lambda c: competitions.CUPS[c][0].split("– ")[1], key="cup_code",
+    ) or "UCL"
+    n_seasons, half_life, _ = settings()
+    try:
+        mdl, mapping = get_europe_model(n_seasons, half_life)
+        fx = competitions.cup_fixtures(code, mapping)
+    except Exception as e:
+        st.error(f"Could not load European cup data: {e}")
+        return
+
+    st.subheader("Upcoming matches")
+    days = st.slider("Days ahead", 1, 60, 14, key="cup_days", help="Counted from the next kick-off.")
+    prediction_table(in_window(fx, days), mdl)
+    st.caption(
+        "One model is fitted on all 18 domestic leagues plus two seasons of European cup results, "
+        "so clubs from different countries are rated on the same scale. Clubs from leagues the app "
+        "doesn't cover (e.g. Norway, Austria, Czechia) are rated from their cup games only. "
+        "Bookmaker odds aren't available for cup matches."
+    )
+
+    st.subheader("Predict any tie")
+    played = competitions.cup_played(code, mapping)
+    teams = sorted((set(fx["HomeTeam"]) | set(fx["AwayTeam"]) | set(played["HomeTeam"])
+                    | set(played["AwayTeam"])) & set(mdl.teams))
+    if len(teams) >= 2:
+        c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+        home = c1.selectbox("Home team", teams, key="cup_home")
+        away = c2.selectbox("Away team", teams, index=1, key="cup_away")
+        neutral = c3.toggle("Neutral venue", help="For a final.", key="cup_neutral")
+        if home == away:
+            st.info("Pick two different teams.")
+        else:
+            match_card(mdl, home, away, neutral)
+
+    with st.expander(f"Results so far this season ({len(played)})"):
+        st.dataframe(
+            pd.DataFrame({
+                "Date": played["Kickoff"].dt.strftime("%a %d %b"), "Home": played["HomeTeam"],
+                "Score": played["FTHG"].astype(int).astype(str) + " – " + played["FTAG"].astype(int).astype(str),
+                "Away": played["AwayTeam"],
+            }),
+            hide_index=True, width="stretch",
+        )
+
+
+def page_international():
+    header("Europe & International", "International", league_picker=False)
+    try:
+        mdl = get_intl_model()
+    except Exception as e:
+        st.error(f"Could not load international results: {e}")
+        return
+
+    st.subheader("UEFA Nations League: upcoming")
+    try:
+        fx = competitions.international_fixtures("UNL", set(mdl.teams))
+        if fx.empty:
+            st.info("No upcoming Nations League matches in the feed right now.")
+        else:
+            prediction_table(fx, mdl)
+    except Exception as e:
+        st.warning(f"Could not load Nations League fixtures: {e}")
+
+    st.subheader("Any two national teams")
+    st.caption(
+        "For World Cup and Euro qualifiers, AFCON qualifiers, friendlies and other matches that "
+        "have no free fixture feed: pick the two teams and the venue."
+    )
+    teams = sorted(t for t in mdl.teams if mdl.n_matches.get(t, 0) >= 5)
+    c1, c2, c3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+    home = c1.selectbox("Team 1 (home)", teams, index=teams.index("England") if "England" in teams else 0,
+                        key="intl_home")
+    away = c2.selectbox("Team 2 (away)", teams, index=teams.index("France") if "France" in teams else 1,
+                        key="intl_away")
+    neutral = c3.toggle("Neutral venue", key="intl_neutral",
+                        help="Tournament finals are usually at a neutral venue.")
+    if home == away:
+        st.info("Pick two different teams.")
+    else:
+        match_card(mdl, home, away, neutral)
+
+    with st.expander("Strongest national teams (model rating)"):
+        r = mdl.ratings()
+        r = r[r["Matches"] >= 10].head(40).reset_index(drop=True)
+        r.index += 1
+        st.dataframe(r[["Team", "Overall", "Attack", "Defence", "Matches"]].round(2), width="stretch")
+    st.caption(
+        "Fitted on the last 8 years of full internationals (source: "
+        "[international_results](https://github.com/martj42/international_results)), recent "
+        f"matches weighted more, friendlies at {competitions.FRIENDLY_WEIGHT:.0%} weight, and no "
+        "home advantage at neutral venues. The results file is updated by volunteers, so the most "
+        "recent window can be missing for a while."
+    )
+
+
 # ---------------- navigation ----------------
 P = {
     "top": st.Page(page_top_picks, title="Most likely 10", icon=":material/star:",
@@ -611,6 +800,9 @@ P = {
                          url_path="predictor"),
     "ratings": st.Page(page_ratings, title="Team ratings", icon=":material/leaderboard:",
                        url_path="ratings"),
+    "cups": st.Page(page_cups, title="European cups", icon=":material/trophy:", url_path="cups"),
+    "intl": st.Page(page_international, title="International", icon=":material/public:",
+                    url_path="international"),
     "form": st.Page(page_form, title="Form", icon=":material/trending_up:", url_path="form"),
     "backtest": st.Page(page_backtest, title="Backtest", icon=":material/science:",
                         url_path="backtest"),
@@ -618,6 +810,7 @@ P = {
 MENU = [
     ("Top picks", ":material/emoji_events:", ["top", "daily"]),
     ("Fixtures", ":material/calendar_month:", ["fixtures"]),
+    ("Europe & International", ":material/language:", ["cups", "intl"]),
     ("Predictor", ":material/online_prediction:", ["predictor"]),
     ("Analysis", ":material/analytics:", ["ratings", "form", "backtest"]),
 ]

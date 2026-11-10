@@ -12,6 +12,7 @@ import re
 import numpy as np
 import pandas as pd
 
+import competitions
 import data
 import model
 
@@ -21,13 +22,22 @@ CANDIDATE_COLS = [
 ]
 
 
-def build_candidates(fixtures: list[tuple[str, model.DixonColes, pd.DataFrame]]) -> pd.DataFrame:
-    """fixtures: [(div, fitted model, upcoming fixtures)] -> one row per (match, market)."""
+NAMES = {**data.LEAGUES, **competitions.COMPETITIONS}
+
+
+def build_candidates(
+    fixtures: list[tuple[str, model.DixonColes, pd.DataFrame]], min_matches: int = 0
+) -> pd.DataFrame:
+    """fixtures: [(competition code, fitted model, upcoming fixtures)] -> one row per
+    (match, market). Matches with a team the model has seen fewer than `min_matches` times are
+    skipped: their probabilities are too uncertain to rank against well-known teams."""
     rows = []
     for div, mdl, fx in fixtures:
         for f in fx.to_dict("records"):  # not itertuples: it renames "Avg>2.5"
             home, away = f["HomeTeam"], f["AwayTeam"]
             if not (mdl.knows(home) and mdl.knows(away)):
+                continue
+            if min(mdl.n_matches.get(home, 0), mdl.n_matches.get(away, 0)) < min_matches:
                 continue
             p = mdl.predict(home, away)
             for market, (keys, col) in model.MARKETS.items():
@@ -36,7 +46,7 @@ def build_candidates(fixtures: list[tuple[str, model.DixonColes, pd.DataFrame]])
                 mo = float(mo) if mo is not None and pd.notna(mo) and float(mo) > 1 else np.nan
                 rows.append({
                     "Kickoff": f["Kickoff"], "Day": f["Kickoff"].date(), "Div": div,
-                    "League": data.LEAGUES.get(div, div), "Home": home, "Away": away,
+                    "League": NAMES.get(div, div), "Home": home, "Away": away,
                     "Match": f"{home} vs {away}", "Market": market,
                     "Pick": market.replace("Home", home).replace("Away", away),
                     "Prob": prob, "FairOdds": 1 / prob if prob > 0 else np.inf,
@@ -157,6 +167,9 @@ LEAGUE_WORDS = {
     "eredivisie": "N1", "netherlands": "N1", "dutch": "N1", "primeira": "P1", "portugal": "P1",
     "pro league": "B1", "belgium": "B1", "super lig": "T1", "süper lig": "T1", "turkey": "T1",
     "scotland": "SC0", "scottish": "SC0",
+    "champions league": "UCL", "ucl": "UCL", "europa": "UEL", "uel": "UEL",
+    "conference": "UECL", "uecl": "UECL", "nations league": "UNL", "international": "UNL",
+    "national team": "UNL",
 }
 MARKET_WORDS = [
     (r"both teams|btts|gg\b", ["Both teams score"]),
@@ -238,7 +251,7 @@ def answer(q: str, cands: pd.DataFrame, today) -> str:
         return "There are no upcoming fixtures loaded right now, so I have nothing to pick from."
     p = parse_question(q, cands, today)
     c = cands
-    if p.get("leagues"):
+    if p.get("leagues") and not p["teams"]:  # "Spain" may be a national team, not La Liga
         c = c[c["Div"].isin(p["leagues"])]
     if "day" in p:
         if not p["day"]:

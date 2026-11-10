@@ -44,6 +44,8 @@ class DixonColes:
         ref_date: pd.Timestamp | None = None,
         l2: float = 0.01,
     ) -> "DixonColes":
+        """Optional columns: `Neutral` (bool, no home advantage) and `Weight` (per-match weight,
+        e.g. lower for friendlies), multiplied into the time-decay weight."""
         teams = sorted(set(matches["HomeTeam"]) | set(matches["AwayTeam"]))
         idx = {t: i for i, t in enumerate(teams)}
         n = len(teams)
@@ -51,27 +53,47 @@ class DixonColes:
         a = matches["AwayTeam"].map(idx).to_numpy()
         x = matches["FTHG"].to_numpy()
         y = matches["FTAG"].to_numpy()
+        hf = 1.0 - matches["Neutral"].astype(float).to_numpy() if "Neutral" in matches else np.ones(len(x))
 
         ref_date = ref_date or matches["Date"].max()
         days = (ref_date - matches["Date"]).dt.days.to_numpy().clip(min=0)
         w = np.exp(-np.log(2) / half_life_days * days)
+        if "Weight" in matches:
+            w = w * matches["Weight"].to_numpy(dtype=float)
         const = gammaln(x + 1) + gammaln(y + 1)
+        m00, m01 = (x == 0) & (y == 0), (x == 0) & (y == 1)
+        m10, m11 = (x == 1) & (y == 0), (x == 1) & (y == 1)
 
         def unpack(p):
             return p[:n], p[n : 2 * n], p[2 * n], p[2 * n + 1], p[2 * n + 2]
 
-        def nll(p):
+        def nll_and_grad(p):
+            """Negative log-likelihood and its exact gradient (needed for big joint fits)."""
             att, dfn, c, home, rho = unpack(p)
-            log_lam = c + home + att[h] - dfn[a]
+            log_lam = c + home * hf + att[h] - dfn[a]
             log_mu = c + att[a] - dfn[h]
             lam, mu = np.exp(log_lam), np.exp(log_mu)
-            ll = (x * log_lam - lam) + (y * log_mu - mu) - const
-            ll += np.log(_tau(x, y, lam, mu, rho))
-            return -np.sum(w * ll) + l2 * (np.sum(att**2) + np.sum(dfn**2))
+            tau = _tau(x, y, lam, mu, rho)
+            ll = (x * log_lam - lam) + (y * log_mu - mu) - const + np.log(tau)
+            # d ll / d log_lam, d log_mu, d rho
+            g_lam = x - lam
+            g_mu = y - mu
+            g_rho = np.zeros_like(lam)
+            g_lam = g_lam + np.where(m00, -lam * mu * rho / tau, 0) + np.where(m01, lam * rho / tau, 0)
+            g_mu = g_mu + np.where(m00, -lam * mu * rho / tau, 0) + np.where(m10, mu * rho / tau, 0)
+            g_rho = (np.where(m00, -lam * mu / tau, 0) + np.where(m01, lam / tau, 0)
+                     + np.where(m10, mu / tau, 0) + np.where(m11, -1 / tau, 0))
+            wl, wm = w * g_lam, w * g_mu
+            d_att = -(np.bincount(h, wl, n) + np.bincount(a, wm, n)) + 2 * l2 * att
+            d_dfn = (np.bincount(a, wl, n) + np.bincount(h, wm, n)) + 2 * l2 * dfn
+            grad = np.concatenate([d_att, d_dfn, [-(wl.sum() + wm.sum()), -(wl * hf).sum(),
+                                                  -(w * g_rho).sum()]])
+            value = -np.sum(w * ll) + l2 * (np.sum(att**2) + np.sum(dfn**2))
+            return value, grad
 
         p0 = np.concatenate([np.zeros(2 * n), [0.2, 0.25, -0.05]])
         bounds = [(-3, 3)] * (2 * n) + [(-3, 3), (-1, 1), (-0.25, 0.25)]
-        res = minimize(nll, p0, method="L-BFGS-B", bounds=bounds)
+        res = minimize(nll_and_grad, p0, jac=True, method="L-BFGS-B", bounds=bounds)
         att, dfn, c, home, rho = unpack(res.x)
         # centre ratings (absorb means into the intercept)
         c += att.mean() - dfn.mean()
@@ -81,17 +103,23 @@ class DixonColes:
         return cls(teams, att, dfn, float(c), float(home), float(rho), counts)
 
     # ---------- prediction ----------
-    def knows(self, team: str) -> bool:
-        return team in self.teams
+    def _index(self, team: str) -> int:
+        if not hasattr(self, "_idx"):
+            self._idx = {t: i for i, t in enumerate(self.teams)}
+        return self._idx[team]
 
-    def expected_goals(self, home: str, away: str) -> tuple[float, float]:
-        i, j = self.teams.index(home), self.teams.index(away)
-        lam = np.exp(self.intercept + self.home_adv + self.attack[i] - self.defence[j])
+    def knows(self, team: str) -> bool:
+        return team in self.n_matches
+
+    def expected_goals(self, home: str, away: str, neutral: bool = False) -> tuple[float, float]:
+        i, j = self._index(home), self._index(away)
+        home_adv = 0.0 if neutral else self.home_adv
+        lam = np.exp(self.intercept + home_adv + self.attack[i] - self.defence[j])
         mu = np.exp(self.intercept + self.attack[j] - self.defence[i])
         return float(lam), float(mu)
 
-    def score_matrix(self, home: str, away: str, max_goals: int = 10) -> np.ndarray:
-        lam, mu = self.expected_goals(home, away)
+    def score_matrix(self, home: str, away: str, max_goals: int = 10, neutral: bool = False) -> np.ndarray:
+        lam, mu = self.expected_goals(home, away, neutral)
         g = np.arange(max_goals + 1)
         m = np.outer(poisson.pmf(g, lam), poisson.pmf(g, mu))
         m[0, 0] *= 1 - lam * mu * self.rho
@@ -100,9 +128,9 @@ class DixonColes:
         m[1, 1] *= 1 - self.rho
         return m / m.sum()
 
-    def predict(self, home: str, away: str) -> dict:
-        m = self.score_matrix(home, away)
-        lam, mu = self.expected_goals(home, away)
+    def predict(self, home: str, away: str, neutral: bool = False) -> dict:
+        m = self.score_matrix(home, away, neutral=neutral)
+        lam, mu = self.expected_goals(home, away, neutral)
         goals = np.add.outer(np.arange(m.shape[0]), np.arange(m.shape[1]))
         flat = [(m[i, j], f"{i}-{j}") for i in range(m.shape[0]) for j in range(m.shape[1])]
         top = sorted(flat, reverse=True)[:5]
