@@ -6,3 +6,4 @@ requests>=2.31
 altair>=5
 tzdata>=2024.1
 anthropic>=2.6
+scikit-learn>=1.5
