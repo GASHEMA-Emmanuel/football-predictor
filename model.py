@@ -120,6 +120,14 @@ class DixonColes:
 
     def score_matrix(self, home: str, away: str, max_goals: int = 10, neutral: bool = False) -> np.ndarray:
         lam, mu = self.expected_goals(home, away, neutral)
+        return self.matrix_from_xg(lam, mu, max_goals)
+
+    def result_probs_from_xg(self, lam: float, mu: float) -> np.ndarray:
+        """(home, draw, away) for given expected goals, e.g. after a team-news adjustment."""
+        m = self.matrix_from_xg(lam, mu)
+        return np.array([np.tril(m, -1).sum(), np.trace(m), np.triu(m, 1).sum()])
+
+    def matrix_from_xg(self, lam: float, mu: float, max_goals: int = 10) -> np.ndarray:
         g = np.arange(max_goals + 1)
         m = np.outer(poisson.pmf(g, lam), poisson.pmf(g, mu))
         m[0, 0] *= 1 - lam * mu * self.rho

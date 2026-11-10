@@ -14,9 +14,11 @@ import datetime as dt
 import difflib
 import io
 import re
+import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -66,6 +68,10 @@ LOCAL_TZ = {  # openfootball times are local kick-off times
 ODDS_COLS = ["AvgH", "AvgD", "AvgA", "Avg>2.5", "Avg<2.5"]
 BASE_COLS = ["Div", "Date", "Time", "HomeTeam", "AwayTeam"]
 RESULT_COLS = ["FTHG", "FTAG", "FTR", "HxG", "AxG"]
+# match stats (shots, shots on target, corners, red cards) used by the deep model
+STAT_COLS = ["HS", "AS", "HST", "AST", "HC", "AC", "HR", "AR"]
+# best available price and closing average: used to test the model against the market
+EXTRA_ODDS_COLS = ["MaxH", "MaxD", "MaxA", "AvgCH", "AvgCD", "AvgCA"]
 
 
 def league_tz(div: str) -> ZoneInfo:
@@ -97,15 +103,43 @@ def _get_csv(url: str, cache_seconds: int = 0) -> pd.DataFrame | None:
     return None if df is None else df.copy()
 
 
-def _download_csv(url: str) -> pd.DataFrame | None:
-    r = requests.get(url, headers=HEADERS, timeout=30)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
+CACHE_DIR = Path(__file__).with_name(".cache")
+_HTTP_SLOTS = threading.Semaphore(6)  # football-data drops connections if hit with ~100 at once
+
+
+def _fetch(url: str) -> bytes | None:
+    """GET with a concurrency cap and retries (transient SSL/connection errors happen)."""
+    for attempt in range(4):
+        try:
+            with _HTTP_SLOTS:
+                r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.content
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 3:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+    return None
+
+
+def _download_csv(url: str, keep_on_disk: bool = False) -> pd.DataFrame | None:
+    """Download a CSV. Finished seasons never change, so they can be kept on disk."""
+    path = CACHE_DIR / url.split("://", 1)[1].replace("/", "_")
+    if keep_on_disk and path.exists():
+        content = path.read_bytes()
+    else:
+        content = _fetch(url)
+        if content is None:
+            return None
+        if keep_on_disk:
+            CACHE_DIR.mkdir(exist_ok=True)
+            path.write_bytes(content)
     try:
-        text = r.content.decode("utf-8-sig")
+        text = content.decode("utf-8-sig")
     except UnicodeDecodeError:
-        text = r.content.decode("latin-1")
+        text = content.decode("latin-1")
     df = pd.read_csv(io.StringIO(text), on_bad_lines="skip", low_memory=False)
     df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
     return df.dropna(axis=1, how="all")
@@ -124,13 +158,17 @@ def load_results(div: str, n_seasons: int = 3, today: dt.date | None = None) -> 
     """Finished matches for `div` over the last `n_seasons` seasons (incl. current)."""
     start = season_start_year(today)
     years = list(range(start - n_seasons + 1, start + 1))
+    def season_csv(y):
+        url = f"{BASE}/mmz4281/{season_code(y)}/{div}.csv"
+        return _download_csv(url, keep_on_disk=True) if y < start else _get_csv(url)
+
     with ThreadPoolExecutor(max_workers=len(years)) as pool:  # seasons download in parallel
-        downloads = pool.map(lambda y: _get_csv(f"{BASE}/mmz4281/{season_code(y)}/{div}.csv"), years)
+        downloads = pool.map(season_csv, years)
     frames = []
     for y, df in zip(years, downloads):
         if df is None or df.empty:
             continue
-        df = _keep(df, BASE_COLS + RESULT_COLS + ODDS_COLS)
+        df = _keep(df, BASE_COLS + RESULT_COLS + STAT_COLS + ODDS_COLS + EXTRA_ODDS_COLS)
         df["Season"] = season_code(y)
         frames.append(df)
     if not frames:

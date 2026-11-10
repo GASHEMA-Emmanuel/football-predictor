@@ -14,6 +14,19 @@ European cups and international football come from [fixturedownload.com](https:/
 - **European cups** use one joint model fitted on all 18 domestic leagues plus two seasons of cup results, so clubs from different countries are rated on the same scale. Clubs from leagues not covered (e.g. Norway, Austria) are rated from their cup games only and flagged as "limited" history.
 - **National teams** use a separate model on the last 8 years of internationals. It has no home advantage at neutral venues, and friendlies count at 60% weight.
 
+## Deep model (domestic leagues)
+Home/draw/away probabilities for the 18 domestic leagues come from a trained model ([deep.py](deep.py)). It combines:
+- a fast-updating Elo rating,
+- form in shots, shots on target and points,
+- rest days,
+- head-to-head record,
+- season points per game,
+- the bookmakers' opening price, when published.
+
+Premier League predictions also use team news (injuries and suspensions, weighted by each player's share of the team's xG+xA) from the official Fantasy Premier League API ([teamnews.py](teamnews.py)). There is no free injury feed for other leagues.
+
+The signals were chosen by testing on seasons the model never saw. Run `python deep_eval.py` (add `--all` for all 18 leagues) to reproduce the comparison with the bookmakers; the **Model report** page shows the same numbers. In short, combined with the bookmaker price it matches or slightly beats the opening odds, but not the closing odds. Its value signals have not yet shown a statistically proven profit.
+
 ## Pages
 - **Most likely 10**: the single most likely outcome of every upcoming match across Europe's top 10 leagues, ranked by probability, plus the chance that all of them come in.
 - **Daily pick (8–15)**: for a chosen day, the most probable accumulator (one leg per match) whose combined odds fall in your range, plus two alternatives that share no matches.

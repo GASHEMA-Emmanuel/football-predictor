@@ -25,14 +25,16 @@ CANDIDATE_COLS = [
 NAMES = {**data.LEAGUES, **competitions.COMPETITIONS}
 
 
-def build_candidates(
-    fixtures: list[tuple[str, model.DixonColes, pd.DataFrame]], min_matches: int = 0
-) -> pd.DataFrame:
-    """fixtures: [(competition code, fitted model, upcoming fixtures)] -> one row per
-    (match, market). Matches with a team the model has seen fewer than `min_matches` times are
-    skipped: their probabilities are too uncertain to rank against well-known teams."""
+def build_candidates(fixtures: list[tuple], min_matches: int = 0) -> pd.DataFrame:
+    """fixtures: [(competition code, fitted model, upcoming fixtures[, result_fn])] -> one row
+    per (match, market). `result_fn(fixture) -> (home, draw, away) | None` overrides the
+    result probabilities (the deep model for domestic leagues); goal markets keep the
+    Dixon-Coles model. Matches with a team the model has seen fewer than `min_matches` times
+    are skipped: their probabilities are too uncertain to rank against well-known teams."""
     rows = []
-    for div, mdl, fx in fixtures:
+    for item in fixtures:
+        div, mdl, fx = item[:3]
+        result_fn = item[3] if len(item) > 3 else None
         for f in fx.to_dict("records"):  # not itertuples: it renames "Avg>2.5"
             home, away = f["HomeTeam"], f["AwayTeam"]
             if not (mdl.knows(home) and mdl.knows(away)):
@@ -40,6 +42,9 @@ def build_candidates(
             if min(mdl.n_matches.get(home, 0), mdl.n_matches.get(away, 0)) < min_matches:
                 continue
             p = mdl.predict(home, away)
+            res = result_fn(f) if result_fn else None
+            if res is not None:
+                p = {**p, "home": float(res[0]), "draw": float(res[1]), "away": float(res[2])}
             for market, (keys, col) in model.MARKETS.items():
                 prob = float(sum(p[k] for k in keys))
                 mo = f.get(col) if col else None

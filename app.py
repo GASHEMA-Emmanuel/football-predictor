@@ -8,8 +8,10 @@ import streamlit as st
 import assistant
 import competitions
 import data
+import deep
 import model
 import picks
+import teamnews
 
 st.set_page_config(page_title="Football Predictor", page_icon="⚽", layout="wide")
 ss = st.session_state
@@ -92,6 +94,42 @@ def get_intl_model():
     return model.DixonColes.fit(competitions.international_results(8), half_life_days=730, l2=JOINT_L2)
 
 
+@st.cache_resource(ttl=6 * 3600, show_spinner="Training the deep model (18 leagues, 8 seasons)…")
+def get_deep_engine() -> deep.DeepEngine:
+    n = data.season_start_year() - deep.WARMUP_FROM + 1
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        raw = dict(zip(data.LEAGUES, pool.map(lambda d: data.load_results(d, n), data.LEAGUES)))
+    return deep.DeepEngine(raw)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_team_news() -> dict:
+    try:
+        return teamnews.team_news()
+    except Exception:  # FPL API down: predictions still work without team news
+        return {}
+
+
+def deep_result(eng, div, home, away, kickoff, odds=None, dc=None, news=None) -> dict | None:
+    """Deep model probabilities, then a cautious team-news adjustment (Premier League)."""
+    r = eng.predict(div, home, away, kickoff, odds)
+    if r is None:
+        return None
+    final = np.array(r["best"], dtype=float)
+    r["news_adj"] = None
+    if news and dc is not None and dc.knows(home) and dc.knows(away):
+        mh = teamnews.xg_multiplier(news.get(home))
+        ma = teamnews.xg_multiplier(news.get(away))
+        if mh < 1 or ma < 1:  # shift by how much the absences move the goals model
+            lam, mu = dc.expected_goals(home, away)
+            delta = dc.result_probs_from_xg(lam * mh, mu * ma) - dc.result_probs_from_xg(lam, mu)
+            final = np.clip(final + delta, 0.005, None)
+            final /= final.sum()
+            r["news_adj"] = final
+    r["final"] = final
+    return r
+
+
 def comp_fixtures(code: str, n_seasons: int, half_life: int) -> tuple[model.DixonColes, pd.DataFrame]:
     """Model + upcoming fixtures for a cup or international competition code."""
     if code in competitions.CUPS:
@@ -122,6 +160,24 @@ def get_candidates(leagues: tuple, n_seasons: int, half_life: int, time_bucket: 
         except Exception as e:  # network hiccup etc.: skip this competition, keep the rest
             return div, None, None, f"{name}: {type(e).__name__}: {e}"
 
+    try:  # deep model + team news for domestic leagues (falls back to Dixon-Coles if it fails)
+        eng = get_deep_engine() if any(d in data.LEAGUES for d in leagues) else None
+        news = get_team_news()
+    except Exception:
+        eng, news = None, {}
+
+    def result_fn(div, mdl):
+        if eng is None or div not in data.LEAGUES:
+            return None
+
+        def fn(f):
+            odds = tuple(f.get(c) for c in ("AvgH", "AvgD", "AvgA"))
+            odds = odds if all(o is not None and pd.notna(o) and o > 1 for o in odds) else None
+            r = deep_result(eng, div, f["HomeTeam"], f["AwayTeam"], f["Kickoff"], odds, mdl,
+                            news if div == "E0" else None)
+            return None if r is None else r["final"]
+        return fn
+
     # the joint European model is shared by three cups: build it once before fanning out
     if any(d in competitions.CUPS for d in leagues):
         try:
@@ -131,7 +187,8 @@ def get_candidates(leagues: tuple, n_seasons: int, half_life: int, time_bucket: 
 
     with ThreadPoolExecutor(max_workers=len(leagues) or 1) as pool:  # leagues download in parallel
         loaded = list(pool.map(one, leagues))
-    fixtures = [(div, mdl, fx) for div, mdl, fx, _ in loaded if fx is not None and not fx.empty]
+    fixtures = [(div, mdl, fx, result_fn(div, mdl)) for div, mdl, fx, _ in loaded
+                if fx is not None and not fx.empty]
     problems = [note for *_, note in loaded if note]
     return picks.build_candidates(fixtures, min_matches=MIN_MATCHES_FOR_PICKS), problems
 
@@ -451,6 +508,146 @@ def chat_widget():
                         st.markdown(m["content"])
 
 
+def last_results(results: pd.DataFrame, team: str, n: int = 6) -> str:
+    g = results[(results.HomeTeam == team) | (results.AwayTeam == team)].tail(n)
+    out = []
+    for r in g.itertuples():
+        home = r.HomeTeam == team
+        gf, ga = (r.FTHG, r.FTAG) if home else (r.FTAG, r.FTHG)
+        res = "W" if gf > ga else "L" if gf < ga else "D"
+        out.append(f"{res} {gf}-{ga} {'v' if home else '@'} {r.AwayTeam if home else r.HomeTeam}")
+    return " · ".join(reversed(out)) or "—"
+
+
+def news_summary(news: dict | None, limit: int = 3) -> str:
+    if not news or news["players"].empty:
+        return ""
+    p = news["players"]
+    key = p[(p["Chance to play"].isin(["0%", "25%"]))].head(limit)
+    return ", ".join(f"{r.Player} ({r.Status.lower()})" for r in key.itertuples())
+
+
+def odds_tuple(f) -> tuple | None:
+    o = (f.get("AvgH"), f.get("AvgD"), f.get("AvgA"))
+    return o if all(x is not None and pd.notna(x) and float(x) > 1 for x in o) else None
+
+
+def value_signal(r: dict, odds: tuple | None, threshold: float = 0.05):
+    """(outcome index, edge) where the deep model + market disagrees most with the price."""
+    if odds is None or r.get("with_market") is None:
+        return None
+    edges = r["final"] * np.array(odds, dtype=float) - 1
+    i = int(edges.argmax())
+    return (i, float(edges[i])) if edges[i] > threshold else None
+
+
+def deep_dive(div: str, home: str, away: str, kickoff: pd.Timestamp, odds: tuple | None = None):
+    """Everything the model knows about one match, and why it leans the way it does."""
+    eng = get_deep_engine()
+    results, dc, _ = league_context(div)
+    news = get_team_news() if div == "E0" else {}
+    r = deep_result(eng, div, home, away, kickoff, odds, dc, news)
+    if r is None:
+        st.info("Not enough league history for one of these teams to run the deep model.")
+        return
+    labels = [f"{home} win", "Draw", f"{away} win"]
+
+    # 1) every view of the probabilities side by side
+    rows = [("Deep model (own signals)", r["own"])]
+    if r["market"] is not None:
+        rows += [("Bookmakers (margin removed)", r["market"]),
+                 ("Deep model + bookmaker price", r["with_market"])]
+    if r["news_adj"] is not None:
+        rows.append(("After team news", r["news_adj"]))
+    pdc = dc.predict(home, away)
+    rows.append(("Season strength model (older model)", np.array([pdc["home"], pdc["draw"], pdc["away"]])))
+    st.dataframe(
+        pd.DataFrame([{"Source": n, labels[0]: p[0], labels[1]: p[1], labels[2]: p[2]} for n, p in rows]),
+        hide_index=True, width="stretch", column_config={c: prob_col(c) for c in labels},
+    )
+
+    # 2) verdict against the market
+    sig = value_signal(r, odds)
+    vb = next((v for v in eng.report["value_bets"] if v[0] == "edge > 5%" and v[1] == "all odds"), None)
+    track = (f" In testing on {eng.report['test_matches']:,} unseen matches, bets with an edge above 5% "
+             f"returned {vb[3]:+.1%} (±{vb[4]:.1%}), which is not yet proof of a real edge."
+             if vb else "")
+    if sig:
+        i, e = sig
+        st.success(
+            f"**Possible value: {labels[i]} at {odds[i]:.2f}.** The model gives {r['final'][i]:.0%}, "
+            f"the bookmakers {r['market'][i]:.0%} (edge {e:+.0%})." + track, icon=":material/target:")
+    elif odds is not None:
+        st.info("The deep model broadly agrees with the bookmakers here: no value signal.",
+                icon=":material/balance:")
+    else:
+        st.info("Bookmaker odds for this match aren't published yet, so this is the model's own view. "
+                "Check back when odds appear to see whether it disagrees with the market.",
+                icon=":material/schedule:")
+
+    # 3) why: contribution of each signal
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown("**Why the model leans this way**")
+        why = r["why"].copy()
+        why["Direction"] = np.where(why["Home vs away"] >= 0, f"favours {home}", f"favours {away}")
+        st.altair_chart(
+            alt.Chart(why).mark_bar().encode(
+                x=alt.X("Home vs away:Q", title=f"← {away}    |    {home} →"),
+                y=alt.Y("Signal:N", sort="-x", title=None),
+                color=alt.Color("Direction:N", legend=None,
+                                scale=alt.Scale(range=[KPI_COLORS[2], KPI_COLORS[0]])),
+                tooltip=["Signal", "Direction", alt.Tooltip("Home vs away:Q", format="+.2f")],
+            ).properties(height=230),
+            width="stretch",
+        )
+        st.caption("Bar length = how strongly each signal pushes the prediction (log-odds). Signals "
+                   "overlap (Elo already counts recent results), so a small bar can point the "
+                   "other way as a correction once the others are counted.")
+    with c2:
+        st.markdown("**Form and context**")
+        x = r["signals"]
+        fh, fa = eng.recent(div, home), eng.recent(div, away)
+        table = pd.DataFrame({
+            "": ["Elo rating", "Shots on target for (form)", "Shots on target against (form)",
+                 "Points per game (form)", "Points per game (season)", "Days since last league match"],
+            home: [fh["Elo"], fh["Shots on target for"], fh["Shots on target against"],
+                   fh["Points per game (form)"], round(x["ppg_h"], 2), x["rest_h"]],
+            away: [fa["Elo"], fa["Shots on target for"], fa["Shots on target against"],
+                   fa["Points per game (form)"], round(x["ppg_a"], 2), x["rest_a"]],
+        })
+        st.dataframe(table.astype(str), hide_index=True, width="stretch")
+
+    st.markdown(f"**Last 6 league matches** (newest first)  \n{home}: {last_results(results, home)}  \n"
+                f"{away}: {last_results(results, away)}")
+
+    # 4) head-to-head
+    meetings = eng.head_to_head(div, home, away)
+    if meetings:
+        st.markdown(f"**Head-to-head** (last {len(meetings)} league meetings): " + " · ".join(
+            f"{d:%b %Y} {h} {gh}-{ga} {away if h == home else home}" for d, h, gh, ga in reversed(meetings)))
+    else:
+        st.caption("No recent league meetings between these teams.")
+
+    # 5) team news (Premier League only)
+    if div == "E0":
+        st.markdown("**Team news** (official Fantasy Premier League data)")
+        if not news:
+            st.caption("Team news is unavailable right now.")
+        for team in (home, away):
+            n = news.get(team)
+            if n is None or n["players"].empty:
+                st.caption(f"{team}: no injuries or suspensions reported.")
+                continue
+            st.markdown(f"{team}: about **{n['missing_attack']:.0%}** of the team's xG+xA is likely missing "
+                        f"(expected goals × {teamnews.xg_multiplier(n):.2f})")
+            st.dataframe(n["players"], hide_index=True, width="stretch")
+        st.caption("The team-news adjustment can't be backtested (no free injury history exists), "
+                   "so it is deliberately cautious.")
+    else:
+        st.caption("Injury data: only available for the Premier League (no free feed for other leagues).")
+
+
 def page_fixtures():
     header("Fixtures", "Upcoming")
     div = ss.league
@@ -470,38 +667,38 @@ def page_fixtures():
         )
         return
 
-    rows, skipped = [], 0
+    eng = get_deep_engine()
+    news = get_team_news() if div == "E0" else {}
+    rows, keys, skipped = [], [], 0
     for rec in fx.to_dict("records"):  # not itertuples: it renames "Avg>2.5"
         f = pd.Series(rec)
         if not (mdl.knows(f.HomeTeam) and mdl.knows(f.AwayTeam)):
             skipped += 1
             continue
         p = mdl.predict(f.HomeTeam, f.AwayTeam)
-        picks = {
-            "Home": (p["home"], f.get("AvgH")),
-            "Draw": (p["draw"], f.get("AvgD")),
-            "Away": (p["away"], f.get("AvgA")),
-            "Over 2.5": (p["over_2_5"], f.get("Avg>2.5")),
-            "Under 2.5": (p["under_2_5"], f.get("Avg<2.5")),
-        }
-        edges = {k: model.edge(pr, o) for k, (pr, o) in picks.items()}
-        best = max(edges, key=lambda k: -1 if np.isnan(edges[k]) else edges[k])
-        value = (
-            f"{best} @ {picks[best][1]:.2f} (+{edges[best]:.0%})"
-            if not np.isnan(edges[best]) and edges[best] > min_edge else "—"
-        )
-        has_odds = pd.notna(f.get("AvgH"))
-        rows.append({
+        odds = odds_tuple(rec)
+        r = deep_result(eng, div, f.HomeTeam, f.AwayTeam, f.Kickoff, odds, mdl, news)
+        ph, pd_, pa = r["final"] if r else (p["home"], p["draw"], p["away"])
+        value = "—"
+        sig = value_signal(r, odds, min_edge) if r else None
+        if sig:
+            name = ["Home", "Draw", "Away"][sig[0]]
+            value = f"{name} @ {odds[sig[0]]:.2f} (+{sig[1]:.0%})"
+        row = {
             "Kick-off (UK)": kickoff_label(f),
             "Match": f"{f.HomeTeam} vs {f.AwayTeam}",
-            "xG": f"{p['xG_home']:.2f} – {p['xG_away']:.2f}",
-            "Home": p["home"], "Draw": p["draw"], "Away": p["away"],
+            "Home": ph, "Draw": pd_, "Away": pa,
             "Over 2.5": p["over_2_5"], "BTTS": p["btts"],
-            "Likely score": p["top_scores"][0][0],
-            "Fair odds (H/D/A)": f"{1/p['home']:.2f} / {1/p['draw']:.2f} / {1/p['away']:.2f}",
-            "Market odds (H/D/A)": f"{f.AvgH:.2f} / {f.AvgD:.2f} / {f.AvgA:.2f}" if has_odds else "—",
-            "Value bet": value,
-        })
+            "xG": f"{p['xG_home']:.2f} – {p['xG_away']:.2f}",
+            "Fair odds (H/D/A)": f"{1/ph:.2f} / {1/pd_:.2f} / {1/pa:.2f}",
+            "Market odds (H/D/A)": " / ".join(f"{o:.2f}" for o in odds) if odds else "—",
+            "Value": value,
+        }
+        if div == "E0":
+            row["Team news"] = "; ".join(s for s in (news_summary(news.get(f.HomeTeam)),
+                                                      news_summary(news.get(f.AwayTeam))) if s) or "—"
+        rows.append(row)
+        keys.append((f.HomeTeam, f.AwayTeam, f.Kickoff, odds))
     if not rows:
         st.info("Fixtures found, but the teams are not in the model's history.")
         return
@@ -509,26 +706,32 @@ def page_fixtures():
         pd.DataFrame(rows), hide_index=True, width="stretch",
         column_config={k: prob_col(k) for k in ["Home", "Draw", "Away", "Over 2.5", "BTTS"]},
     )
-    n_odds = int(fx["AvgH"].notna().sum()) if "AvgH" in fx else 0
+    n_odds = sum(k[3] is not None for k in keys)
     notes = [
-        "Matches that have already kicked off are hidden.",
-        "Fair odds = 1 / model probability. Value bet = best market where the model edge exceeds your threshold.",
+        "Home/Draw/Away come from the deep model (form, shots, Elo, rest, head-to-head"
+        + (", team news" if div == "E0" else "") + ", plus the bookmaker price when published). "
+        "Over 2.5, BTTS and xG come from the season strength model.",
+        f"Value = the deep model's edge over the market is above your threshold ({min_edge:.0%}).",
     ]
-    if n_odds < len(fx):
-        notes.append(
-            f"Market odds are available for {n_odds} of {len(fx)} fixtures; the rest come from the "
-            "season schedule and get odds once football-data publishes that round."
-        )
+    if n_odds < len(keys):
+        notes.append(f"Bookmaker odds are available for {n_odds} of {len(keys)} fixtures.")
     if skipped:
         notes.append(f"{skipped} fixture(s) skipped: team not in the model's history.")
     if unmatched:
         notes.append("Unmatched schedule names: " + ", ".join(unmatched) + ".")
     st.caption(" ".join(notes))
 
+    st.subheader("Deep dive")
+    i = st.selectbox("Match", range(len(keys)), format_func=lambda i: f"{rows[i]['Match']} · {rows[i]['Kick-off (UK)']}",
+                     label_visibility="collapsed")
+    home, away, kickoff, odds = keys[i]
+    deep_dive(div, home, away, kickoff, odds)
+
 
 def page_predictor():
     header("Predictor", "Match predictor")
-    results, mdl, _ = load_league_or_stop(ss.league)
+    div = ss.league
+    results, mdl, _ = load_league_or_stop(div)
     c1, c2 = st.columns(2)
     teams = mdl.teams
     home = c1.selectbox("Home team", teams, index=0)
@@ -536,16 +739,16 @@ def page_predictor():
     if home == away:
         st.info("Pick two different teams.")
         return
-    p = mdl.predict(home, away)
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric(f"{home} win", pct(p["home"]), f"fair {1/p['home']:.2f}", delta_color="off")
-    m2.metric("Draw", pct(p["draw"]), f"fair {1/p['draw']:.2f}", delta_color="off")
-    m3.metric(f"{away} win", pct(p["away"]), f"fair {1/p['away']:.2f}", delta_color="off")
-    m4.metric("Over 2.5 goals", pct(p["over_2_5"]))
-    m5.metric("Both teams score", pct(p["btts"]))
-    st.write(f"**Expected goals:** {home} {p['xG_home']:.2f} – {p['xG_away']:.2f} {away}")
-    st.write("**Most likely scores:** " + " · ".join(f"{s} ({pr:.0%})" for s, pr in p["top_scores"]))
+    st.caption("Predicts the match as if it were played now, using each team's current form.")
+    deep_dive(div, home, away, pd.Timestamp.now(tz=data.UK))
 
+    st.subheader("Goals and scorelines")
+    p = mdl.predict(home, away)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Over 2.5 goals", pct(p["over_2_5"]))
+    m2.metric("Both teams score", pct(p["btts"]))
+    m3.metric("Expected goals", f"{p['xG_home']:.2f} – {p['xG_away']:.2f}")
+    st.write("**Most likely scores:** " + " · ".join(f"{s} ({pr:.0%})" for s, pr in p["top_scores"]))
     mat = p["matrix"][:6, :6]
     grid = pd.DataFrame(
         [(i, j, mat[i, j]) for i in range(6) for j in range(6)],
@@ -562,19 +765,41 @@ def page_predictor():
     st.altair_chart((heat + text).properties(height=360, title="Scoreline probabilities"),
                     width="stretch")
 
-    st.subheader("Recent head-to-head")
-    h2h = results[
-        ((results.HomeTeam == home) & (results.AwayTeam == away))
-        | ((results.HomeTeam == away) & (results.AwayTeam == home))
-    ].sort_values("Date", ascending=False)
-    if h2h.empty:
-        st.caption("No meetings in the loaded history.")
-    else:
-        st.dataframe(
-            h2h[["Date", "HomeTeam", "FTHG", "FTAG", "AwayTeam"]].head(10)
-            .assign(Date=lambda d: d.Date.dt.date),
-            hide_index=True, width="stretch",
-        )
+
+def page_model_report():
+    header("Analysis", "Model report", league_picker=False)
+    eng = get_deep_engine()
+    rep = eng.report
+    st.markdown(
+        f"The deep model was trained on matches from {deep.TRAIN_FROM}-{(deep.TRAIN_FROM + 1) % 100:02d} "
+        f"to {deep.TEST_FROM - 1}-{deep.TEST_FROM % 100:02d} ({rep['train_matches']:,} matches, 18 leagues), "
+        f"then tested on **{rep['test_matches']:,} later matches it had never seen**."
+    )
+    st.subheader("Accuracy against the bookmakers")
+    st.dataframe(
+        pd.DataFrame(rep["metrics"], columns=["Model", "Log-loss (lower is better)", "Accuracy"]),
+        hide_index=True, width="stretch",
+        column_config={"Log-loss (lower is better)": st.column_config.NumberColumn(format="%.4f"),
+                       "Accuracy": st.column_config.NumberColumn(format="percent")},
+    )
+    st.caption("Log-loss rewards giving high probability to what actually happens; it's the "
+               "standard way to compare forecasters. Closing odds are the sharpest benchmark.")
+    st.subheader("If you had bet every value signal")
+    vb = pd.DataFrame(rep["value_bets"], columns=["Rule", "Odds range", "Bets", "Return per bet", "± (95%)"])
+    st.dataframe(vb, hide_index=True, width="stretch", column_config={
+        "Return per bet": st.column_config.NumberColumn(format="percent"),
+        "± (95%)": st.column_config.NumberColumn(format="percent")})
+    st.caption("1 unit per bet at the best available price, using the deep model + bookmaker price. "
+               "If the ± range includes zero, the result could be luck.")
+    st.subheader("What this means")
+    st.markdown(
+        "- The deep model is clearly better than the app's older season-strength model.\n"
+        "- On its own signals it is still a little less accurate than the bookmakers: they already "
+        "price in form, injuries and head-to-head records.\n"
+        "- Combined with the bookmaker price it matches or slightly beats the opening odds, which is "
+        "what makes its value signals worth looking at. It does not reliably beat the closing odds.\n"
+        "- Treat value signals as a shortlist to research, not as sure bets. Stake small."
+    )
 
 
 def page_ratings():
@@ -803,6 +1028,8 @@ P = {
     "cups": st.Page(page_cups, title="European cups", icon=":material/trophy:", url_path="cups"),
     "intl": st.Page(page_international, title="International", icon=":material/public:",
                     url_path="international"),
+    "report": st.Page(page_model_report, title="Model report", icon=":material/fact_check:",
+                      url_path="model-report"),
     "form": st.Page(page_form, title="Form", icon=":material/trending_up:", url_path="form"),
     "backtest": st.Page(page_backtest, title="Backtest", icon=":material/science:",
                         url_path="backtest"),
@@ -812,7 +1039,7 @@ MENU = [
     ("Fixtures", ":material/calendar_month:", ["fixtures"]),
     ("Europe & International", ":material/language:", ["cups", "intl"]),
     ("Predictor", ":material/online_prediction:", ["predictor"]),
-    ("Analysis", ":material/analytics:", ["ratings", "form", "backtest"]),
+    ("Analysis", ":material/analytics:", ["report", "ratings", "form", "backtest"]),
 ]
 
 current = st.navigation(list(P.values()), position="hidden")
