@@ -9,6 +9,7 @@ import assistant
 import competitions
 import data
 import deep
+import history
 import model
 import picks
 import teamnews
@@ -191,6 +192,16 @@ def get_candidates(leagues: tuple, n_seasons: int, half_life: int, time_bucket: 
                 if fx is not None and not fx.empty]
     problems = [note for *_, note in loaded if note]
     return picks.build_candidates(fixtures, min_matches=MIN_MATCHES_FOR_PICKS), problems
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner="Rebuilding past daily picks…")
+def get_past_pools(days_back: int, n_seasons: int, half_life: int, today_iso: str) -> dict:
+    """Candidate selections for each past day, rebuilt with only earlier data (see history.py)."""
+    eng = get_deep_engine()
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        domestic = dict(zip(data.LEAGUES, pool.map(lambda d: get_results(d, n_seasons), data.LEAGUES)))
+    return history.past_pools(days_back, domestic, eng.past, half_life,
+                              pd.Timestamp(today_iso).date(), MIN_MATCHES_FOR_PICKS)
 
 
 @st.cache_data(show_spinner="Running backtest…")
@@ -393,12 +404,9 @@ def page_daily_pick():
         "One leg per match, picked across Europe's top leagues, the European cups and the Nations League."
     )
     cands, _ = load_candidates(competitions.DEFAULT_PICK_SET)
-    if cands.empty:
-        st.info("No upcoming fixtures loaded yet.")
-        return
 
-    days = sorted(set(cands["Day"]))
-    per_day = cands.groupby("Day")["Match"].nunique()
+    days = sorted(set(cands["Day"])) if not cands.empty else []
+    per_day = cands.groupby("Day")["Match"].nunique() if not cands.empty else pd.Series(dtype=int)
     busy = [i for i, d in enumerate(days) if per_day[d] >= 6]  # default: first proper match day
     c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
     day = c1.selectbox(
@@ -412,38 +420,104 @@ def page_daily_pick():
         help="Every leg must be at least this likely. Stops the ticket from being one long shot.",
     )
     market_set = st.radio("Markets", list(model.MARKET_SETS), index=2, horizontal=True)
+    markets = model.MARKET_SETS[market_set]
+    ticket_kw = dict(min_odds=lo, max_odds=hi, max_legs=int(max_legs), min_leg_prob=min_leg)
 
-    if isinstance(day, str):
-        pool = cands[cands["Day"].isin(days[:3])]
+    # ---------- today's / upcoming pick
+    if cands.empty:
+        st.info("No upcoming fixtures loaded yet.")
     else:
-        pool = cands[cands["Day"] == day]
-    pool = pool[pool["Market"].isin(model.MARKET_SETS[market_set])]
-    tickets = picks.accumulators(pool, n=3, min_odds=lo, max_odds=hi,
-                                 max_legs=int(max_legs), min_leg_prob=min_leg)
-    if not tickets:
-        st.info(
-            f"No ticket between {lo:g} and {hi:g} fits these settings ({pool['Match'].nunique()} matches "
-            "available). Try more legs, a lower minimum leg chance, or another day."
-        )
+        pool = cands[cands["Day"].isin(days[:3])] if isinstance(day, str) else cands[cands["Day"] == day]
+        pool = pool[pool["Market"].isin(markets)]
+        tickets = picks.accumulators(pool, n=3, **ticket_kw)
+        if not tickets:
+            st.info(
+                f"No ticket between {lo:g} and {hi:g} fits these settings ({pool['Match'].nunique()} "
+                "matches available). Try more legs, a lower minimum leg chance, or another day."
+            )
+        for i, t in enumerate(tickets):
+            s = picks.ticket_summary(t)
+            st.subheader("Daily pick" if i == 0 else f"Alternative {i}")
+            kpi_cards([
+                ("Combined odds", f"{s['combined_odds']:.2f}", f"{s['odds_source']} odds"),
+                ("Model chance all win", f"{s['model_probability']:.1%}",
+                 f"about 1 in {1 / s['model_probability']:.0f}"),
+                ("Legs", str(s["legs"]), f"weakest leg {t['Prob'].min():.0%}"),
+                ("Expected return", f"{(s['expected_return_per_unit'] if abs(s['expected_return_per_unit']) > 1e-6 else 0.0):+.0%}",
+                 "per unit staked, if the model is right"),
+            ])
+            show_legs(t)
+        if tickets:
+            st.info(
+                "When the odds come from the model (bookmakers haven't priced the round yet), the "
+                "expected return is 0% by construction: the ticket is the *most likely* way to reach "
+                "those odds, not a value bet. Real bookmaker odds include a margin, so the real return "
+                "is usually negative.",
+                icon=":material/info:",
+            )
+
+    # ---------- track record
+    st.subheader("Previous daily picks")
+    lookback = st.select_slider("Look back", [7, 14, 21, 30, 45, 60], value=21,
+                                format_func=lambda d: f"{d} days")
+    n_seasons, half_life, _ = settings()
+    today = pd.Timestamp.now(tz=data.UK).date()
+    try:
+        pools = get_past_pools(lookback, n_seasons, half_life, today.isoformat())
+    except Exception as e:
+        st.warning(f"Could not rebuild past picks: {e}")
+        return
+    pools = {d: p[p["Market"].isin(markets)] for d, p in pools.items()}
+    record = history.track_record(pools, **ticket_kw)
+    if not record:
+        st.info("No past days in this window had enough matches for a ticket with these settings.")
         return
 
-    for i, t in enumerate(tickets):
-        s = picks.ticket_summary(t)
-        st.subheader("Daily pick" if i == 0 else f"Alternative {i}")
-        kpi_cards([
-            ("Combined odds", f"{s['combined_odds']:.2f}", f"{s['odds_source']} odds"),
-            ("Model chance all win", f"{s['model_probability']:.1%}",
-             f"about 1 in {1 / s['model_probability']:.0f}"),
-            ("Legs", str(s["legs"]), f"weakest leg {t['Prob'].min():.0%}"),
-            ("Expected return", f"{s['expected_return_per_unit']:+.0%}",
-             "per unit staked, if the model is right"),
-        ])
-        show_legs(t)
-    st.info(
-        "When the odds come from the model (bookmakers haven't priced the round yet), the expected "
-        "return is 0% by construction: the ticket is the *most likely* way to reach those odds, not a "
-        "value bet. Real bookmaker odds include a margin, so the real return is usually negative.",
-        icon=":material/info:",
+    settled = [r for r in record if r["status"] != "Pending"]
+    won = [r for r in settled if r["status"] == "Won"]
+    profit = sum(r["combined_odds"] - 1 if r["status"] == "Won" else -1 for r in settled)
+    expected = sum(r["model_probability"] for r in settled)
+    kpi_cards([
+        ("Tickets won", f"{len(won)} / {len(settled)}",
+         f"{len(won) / len(settled):.0%} hit rate" if settled else "none settled yet"),
+        ("Model expected", f"{expected:.1f} wins", "sum of each ticket's chance"),
+        ("Profit", f"{profit:+.1f} units", "1 unit per ticket at its combined odds"),
+        ("Legs won", f"{sum(r['legs_won'] for r in settled)} / {sum(r['legs'] for r in settled)}",
+         "individual selections"),
+    ])
+
+    icon = {"Won": "✅ Won", "Lost": "❌ Lost", "Pending": "⏳ Pending"}
+    summary = pd.DataFrame([{
+        "Date": r["date"].strftime("%a %d %b"), "Legs": r["legs"],
+        "Legs won": f"{r['legs_won']} / {r['legs']}",
+        "Combined odds": r["combined_odds"], "Model chance": r["model_probability"],
+        "Result": icon[r["status"]],
+    } for r in record])
+    st.dataframe(summary, hide_index=True, width="stretch", column_config={
+        "Combined odds": st.column_config.NumberColumn(format="%.2f"),
+        "Model chance": st.column_config.NumberColumn(format="percent"),
+    })
+
+    for r in record:
+        t = r["ticket"]
+        with st.expander(f"{r['date']:%A %d %b} · {r['legs']} legs @ {r['combined_odds']:.2f} · "
+                         f"{icon[r['status']]}"):
+            st.dataframe(pd.DataFrame({
+                "Kick-off (UK)": t["Kickoff"].dt.strftime("%H:%M"), "League": t["League"],
+                "Match": t["Match"], "Pick": t["Pick"], "Probability": t["Prob"],
+                "Odds": t["Odds"], "Score": t["Score"],
+                "Result": t["Won"].map(lambda w: "⏳ Pending" if w is None or pd.isna(w)
+                                       else "✅ Won" if w else "❌ Lost"),
+            }), hide_index=True, width="stretch", column_config={
+                "Probability": prob_col("Probability"),
+                "Odds": st.column_config.NumberColumn(format="%.2f"),
+            })
+    st.caption(
+        "Each past ticket is rebuilt with only the information available before that day (models "
+        "refitted on earlier matches) and the same settings as above, then graded with the final "
+        "scores. Odds are bookmaker averages where the results feed has them, otherwise the model's "
+        "fair odds. Results feeds can lag a few days, so the most recent days may be missing "
+        "matches or show as pending."
     )
 
 

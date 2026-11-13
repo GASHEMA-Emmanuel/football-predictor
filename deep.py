@@ -213,6 +213,25 @@ class DeepEngine:
         self.own = train(hist, BASE_FEATURES)
         self.mkt = train(hist.dropna(subset=MARKET_FEATURES), MARKET_FEATURES)
         self.n_train = len(hist)
+        self.past = self._past_probs(hist)
+
+    @staticmethod
+    def _past_probs(hist: pd.DataFrame) -> dict:
+        """Leak-free probabilities for this season's played matches, for grading past picks:
+        a classifier trained only on earlier seasons, fed each match's pre-kick-off signals.
+        Key: (Div, Date, HomeTeam, AwayTeam) -> (home, draw, away)."""
+        current = hist["Start"].max()
+        before, now = hist[hist["Start"] < current], hist[hist["Start"] == current]
+        if before.empty or now.empty:
+            return {}
+        own = train(before, BASE_FEATURES)
+        mkt = train(before.dropna(subset=MARKET_FEATURES), MARKET_FEATURES)
+        P = predict_proba(own, now, BASE_FEATURES)
+        has_mkt = now[MARKET_FEATURES].notna().all(axis=1).to_numpy()
+        if has_mkt.any():
+            P[has_mkt] = predict_proba(mkt, now[has_mkt], MARKET_FEATURES)
+        keys = zip(now["Div"], now["Date"], now["HomeTeam"], now["AwayTeam"])
+        return {k: p for k, p in zip(keys, P)}
 
     @staticmethod
     def _report(hist: pd.DataFrame) -> dict:
