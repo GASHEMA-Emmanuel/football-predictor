@@ -187,6 +187,9 @@ def explain(clf, x: dict, features: list[str]) -> pd.DataFrame:
 
 
 # ---------------- engine used by the app ----------------
+# Bump whenever DeepEngine gains or changes attributes: the app caches the trained engine for
+# hours, and a new version number forces a rebuild instead of serving a stale object.
+ENGINE_VERSION = 2
 TRAIN_FROM = 2019   # bookmaker average/max odds columns exist from 2019-20
 TEST_FROM = 2025    # held-out seasons for the honest report
 WARMUP_FROM = 2018  # one season to warm up Elo/form before training rows start

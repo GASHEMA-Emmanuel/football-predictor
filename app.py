@@ -96,7 +96,8 @@ def get_intl_model():
 
 
 @st.cache_resource(ttl=6 * 3600, show_spinner="Training the deep model (18 leagues, 8 seasons)…")
-def get_deep_engine() -> deep.DeepEngine:
+def get_deep_engine(version: int = deep.ENGINE_VERSION) -> deep.DeepEngine:
+    """`version` is part of the cache key: a model change forces a rebuild."""
     n = data.season_start_year() - deep.WARMUP_FROM + 1
     with ThreadPoolExecutor(max_workers=6) as pool:
         raw = dict(zip(data.LEAGUES, pool.map(lambda d: data.load_results(d, n), data.LEAGUES)))
@@ -162,7 +163,7 @@ def get_candidates(leagues: tuple, n_seasons: int, half_life: int, time_bucket: 
             return div, None, None, f"{name}: {type(e).__name__}: {e}"
 
     try:  # deep model + team news for domestic leagues (falls back to Dixon-Coles if it fails)
-        eng = get_deep_engine() if any(d in data.LEAGUES for d in leagues) else None
+        eng = get_deep_engine(deep.ENGINE_VERSION) if any(d in data.LEAGUES for d in leagues) else None
         news = get_team_news()
     except Exception:
         eng, news = None, {}
@@ -197,7 +198,7 @@ def get_candidates(leagues: tuple, n_seasons: int, half_life: int, time_bucket: 
 @st.cache_data(ttl=3 * 3600, show_spinner="Rebuilding past daily picks…")
 def get_past_pools(days_back: int, n_seasons: int, half_life: int, today_iso: str) -> dict:
     """Candidate selections for each past day, rebuilt with only earlier data (see history.py)."""
-    eng = get_deep_engine()
+    eng = get_deep_engine(deep.ENGINE_VERSION)
     with ThreadPoolExecutor(max_workers=6) as pool:
         domestic = dict(zip(data.LEAGUES, pool.map(lambda d: get_results(d, n_seasons), data.LEAGUES)))
     return history.past_pools(days_back, domestic, eng.past, half_life,
@@ -617,7 +618,7 @@ def value_signal(r: dict, odds: tuple | None, threshold: float = 0.05):
 
 def deep_dive(div: str, home: str, away: str, kickoff: pd.Timestamp, odds: tuple | None = None):
     """Everything the model knows about one match, and why it leans the way it does."""
-    eng = get_deep_engine()
+    eng = get_deep_engine(deep.ENGINE_VERSION)
     results, dc, _ = league_context(div)
     news = get_team_news() if div == "E0" else {}
     r = deep_result(eng, div, home, away, kickoff, odds, dc, news)
@@ -741,7 +742,7 @@ def page_fixtures():
         )
         return
 
-    eng = get_deep_engine()
+    eng = get_deep_engine(deep.ENGINE_VERSION)
     news = get_team_news() if div == "E0" else {}
     rows, keys, skipped = [], [], 0
     for rec in fx.to_dict("records"):  # not itertuples: it renames "Avg>2.5"
@@ -842,7 +843,7 @@ def page_predictor():
 
 def page_model_report():
     header("Analysis", "Model report", league_picker=False)
-    eng = get_deep_engine()
+    eng = get_deep_engine(deep.ENGINE_VERSION)
     rep = eng.report
     st.markdown(
         f"The deep model was trained on matches from {deep.TRAIN_FROM}-{(deep.TRAIN_FROM + 1) % 100:02d} "
